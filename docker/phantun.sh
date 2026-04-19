@@ -98,9 +98,13 @@ _ip6tables() {
 }
 
 apply_sysctl() {
-  info "apply sysctl: $(sysctl -w net.ipv4.ip_forward=1)"
+  if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || warn "sysctl net.ipv4.ip_forward failed (may need host-level setting)"
+  fi
   ! _is_ipv4_only "$@" || return
-  info "apply sysctl: $(sysctl -w net.ipv6.conf.all.forwarding=1)"
+  if [ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)" != "1" ]; then
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || warn "sysctl ipv6 forwarding failed"
+  fi
 }
 
 apply_iptables() {
