@@ -54,9 +54,9 @@ since 2023. Phantun's MIPS build are therefore built using nightly Rust toolchai
 | armv7 | `armv7-unknown-linux-musleabihf` | 252（armv7l／armhf，32 位 ARM） |
 | arm64 | `aarch64-unknown-linux-musl` | router（aarch64_cortex-a53，64 位 ARM） |
 
-在 Actions 页面选择 `Build Linux Binaries` → `Run workflow` 可以手动运行；推送匹配 `v*.*.*` 的版本 Tag（例如 `v0.8.1-reconnect.1`）时自动触发，普通分支推送不会触发此工作流。每个架构生成一份 native artifact，共 3 份，结果保留 14 天。native 包包含 `phantun_client`、`phantun_server` 和 `VERSION`，程序为静态 ELF，不依赖目标系统的 glibc。
+在 Actions 页面选择 `Build Linux Binaries` → `Run workflow` 可以手动运行；默认分支手动运行只生成三架构 native artifact。推送匹配 `v*.*.*` 的版本 Tag（例如 `v0.8.1-reconnect.1`）时，工作流会编译 amd64、armv7、arm64，只有三个平台全部成功后才创建对应的 GitHub Release，并上传 3 个 `.tar.gz` 原生包和总 `SHA256SUMS`。Actions artifacts 保留 14 天。Rust 与 Docker workflow 仅用于分支或 PR 检查，不参与 Tag 发布。
 
-从 GitHub 下载 artifact 后，先解开外层 ZIP，再使用 `tar -xzf` 解压 native 包即可得到两个可执行文件和 `VERSION`。包内同时提供客户端与服务端程序，具体部署哪一个由使用场景决定。该工作流只保存 Actions artifacts，不发布 Release 或镜像。原生程序运行仍需要 TUN 和现有防火墙设置。
+Release 页面中的原生包可以直接下载，无需解开外层 ZIP；从 Actions 下载 artifact 时，需要先解开外层 ZIP，再使用 `tar -xzf` 解压 native 包即可得到两个可执行文件和 `VERSION`。包内同时提供客户端与服务端程序，具体部署哪一个由使用场景决定。原生程序运行仍需要 TUN 和现有防火墙设置。
 
 # Overview
 

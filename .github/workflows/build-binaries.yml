@@ -73,3 +73,45 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: build-native
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download native packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: phantun-*-native
+          path: artifacts
+          merge-multiple: false
+
+      - name: Verify and collect release packages
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 armv7 arm64; do
+            dir="artifacts/phantun-${arch}-native"
+            test -d "$dir"
+            (cd "$dir" && sha256sum -c SHA256SUMS)
+            mapfile -t archives < <(find "$dir" -maxdepth 1 -type f -name '*.tar.gz' -print)
+            test "${#archives[@]}" -eq 1
+            cp "${archives[0]}" dist/
+          done
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 3
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          name: Phantun ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
