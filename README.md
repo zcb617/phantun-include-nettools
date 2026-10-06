@@ -9,6 +9,7 @@ A lightweight and fast UDP to TCP obfuscator.
 
 * [Phantun](#phantun)
 * [Latest release](#latest-release)
+* [GitHub Actions 三平台二进制构建](#github-actions-三平台二进制构建)
 * [Overview](#overview)
 * [Usage](#usage)
     * [1. Enable Kernel IP forwarding](#1-enable-kernel-ip-forwarding)
@@ -42,6 +43,20 @@ A lightweight and fast UDP to TCP obfuscator.
   [Rust only provides Tier 3 supports for MIPS based platforms](https://github.com/rust-lang/compiler-team/issues/648)
 since 2023. Phantun's MIPS build are therefore built using nightly Rust toolchain and provided on a best effort basis only.
 </details>
+
+## GitHub Actions 三平台二进制构建
+
+仓库的 GitHub Actions 工作流 `Build Linux Binaries` 会为以下三种平台构建静态 Linux 程序。当前设备用途如下：
+
+| 架构 | Rust target | 当前设备用途 |
+| --- | --- | --- |
+| amd64 | `x86_64-unknown-linux-musl` | 阿里云服务器（x86_64） |
+| armv7 | `armv7-unknown-linux-musleabihf` | 252（armv7l／armhf，32 位 ARM） |
+| arm64 | `aarch64-unknown-linux-musl` | router（aarch64_cortex-a53，64 位 ARM） |
+
+在 Actions 页面选择 `Build Linux Binaries` → `Run workflow` 可以手动运行；向 `main` 推送匹配 Rust 源码、Cargo 配置、锁定文件或该 workflow 的变更时也会自动触发。每个架构生成一份 native artifact，共 3 份，结果保留 14 天。native 包包含 `phantun_client`、`phantun_server` 和 `VERSION`，程序为静态 ELF，不依赖目标系统的 glibc。
+
+从 GitHub 下载 artifact 后，先解开外层 ZIP，再使用 `tar -xzf` 解压 native 包即可得到两个可执行文件和 `VERSION`。包内同时提供客户端与服务端程序，具体部署哪一个由使用场景决定。该工作流只保存 Actions artifacts，不发布 Release 或镜像。原生程序运行仍需要 TUN 和现有防火墙设置。
 
 # Overview
 

@@ -1,0 +1,80 @@
+name: Build Linux Binaries
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-binaries.yml'
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: armv7
+            target: armv7-unknown-linux-musleabihf
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.90.0'
+          targets: ${{ matrix.target }}
+
+      - name: Build static binaries
+        run: |
+          set -euo pipefail
+          phantun_sysroot="$(rustc --print sysroot)"
+          export RUSTFLAGS="-C linker=${phantun_sysroot}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld -C linker-flavor=ld.lld -C link-self-contained=yes"
+          cargo build --workspace --release --locked --target "$TARGET"
+
+      - name: Package native binaries
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "phantun") | .version')"
+          test -n "$version"
+          mkdir -p package dist
+          install -m755 "target/$TARGET/release/client" package/phantun_client
+          install -m755 "target/$TARGET/release/server" package/phantun_server
+          printf '%s\n' "$version" > package/VERSION
+          for binary in package/phantun_client package/phantun_server; do
+            file "$binary"
+            readelf -h "$binary"
+            if readelf -l "$binary" | grep -q 'INTERP'; then
+              echo "错误：$binary 不是静态 ELF" >&2
+              exit 1
+            fi
+          done
+          tar -czf "dist/phantun-$version-$ARCH-native.tar.gz" -C package phantun_client phantun_server VERSION
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+
+      - name: Upload native package
+        uses: actions/upload-artifact@v4
+        with:
+          name: phantun-${{ matrix.arch }}-native
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
