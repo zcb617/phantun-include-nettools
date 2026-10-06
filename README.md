@@ -54,7 +54,7 @@ since 2023. Phantun's MIPS build are therefore built using nightly Rust toolchai
 | armv7 | `armv7-unknown-linux-musleabihf` | 252（armv7l／armhf，32 位 ARM） |
 | arm64 | `aarch64-unknown-linux-musl` | router（aarch64_cortex-a53，64 位 ARM） |
 
-在 Actions 页面选择 `Build Linux Binaries` → `Run workflow` 可以手动运行；向 `main` 推送匹配 Rust 源码、Cargo 配置、锁定文件或该 workflow 的变更时也会自动触发。每个架构生成一份 native artifact，共 3 份，结果保留 14 天。native 包包含 `phantun_client`、`phantun_server` 和 `VERSION`，程序为静态 ELF，不依赖目标系统的 glibc。
+在 Actions 页面选择 `Build Linux Binaries` → `Run workflow` 可以手动运行；推送匹配 `v*.*.*` 的版本 Tag（例如 `v0.8.1-reconnect.1`）时自动触发，普通分支推送不会触发此工作流。每个架构生成一份 native artifact，共 3 份，结果保留 14 天。native 包包含 `phantun_client`、`phantun_server` 和 `VERSION`，程序为静态 ELF，不依赖目标系统的 glibc。
 
 从 GitHub 下载 artifact 后，先解开外层 ZIP，再使用 `tar -xzf` 解压 native 包即可得到两个可执行文件和 `VERSION`。包内同时提供客户端与服务端程序，具体部署哪一个由使用场景决定。该工作流只保存 Actions artifacts，不发布 Release 或镜像。原生程序运行仍需要 TUN 和现有防火墙设置。
 
