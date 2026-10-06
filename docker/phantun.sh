@@ -1,12 +1,17 @@
 #!/bin/bash
 
-# alias ​​settings must be global, and must be defined before the function being called with the alias
-if [ "$USE_IPTABLES_NFT_BACKEND" = 1 ]; then
-  alias iptables=iptables-nft
-  alias iptables-save=iptables-nft-save
-  alias ip6tables=ip6tables-nft
-  alias ip6tables-save=ip6tables-nft-save
-fi
+# Select the backend explicitly: distribution defaults can change across images.
+# Functions also work in non-interactive Bash, where aliases are not expanded.
+case "${USE_IPTABLES_NFT_BACKEND:-0}" in
+  0) IPTABLES_BACKEND=legacy ;;
+  1) IPTABLES_BACKEND=nft ;;
+  *) printf 'Invalid USE_IPTABLES_NFT_BACKEND: expected 0 or 1\n' >&2; exit 64 ;;
+esac
+
+iptables() { command "iptables-${IPTABLES_BACKEND}" "$@"; }
+iptables-save() { command "iptables-${IPTABLES_BACKEND}-save" "$@"; }
+ip6tables() { command "ip6tables-${IPTABLES_BACKEND}" "$@"; }
+ip6tables-save() { command "ip6tables-${IPTABLES_BACKEND}-save" "$@"; }
 
 info() {
   local green='\e[0;32m'
