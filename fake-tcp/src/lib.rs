@@ -45,14 +45,14 @@ pub mod packet;
 use bytes::{Bytes, BytesMut};
 use log::{error, info, trace, warn};
 use packet::*;
-use pnet::packet::{tcp, Packet};
+use pnet::packet::{Packet, tcp};
 use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Arc, RwLock,
+    atomic::{AtomicU32, Ordering},
 };
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -180,6 +180,21 @@ impl Socket {
         }
     }
 
+    /// 发送不推进本地序号的 ACK 型健康探测，确认本地 Tun 仍可写入。
+    pub async fn send_keepalive(&self) -> Option<()> {
+        match self.state {
+            State::Established => {
+                let next_seq = self.seq.load(Ordering::Relaxed);
+                let ack = self.ack.load(Ordering::Relaxed);
+                let buf =
+                    build_tcp_keepalive_packet(self.local_addr, self.remote_addr, next_seq, ack);
+                self.last_ack.store(ack, Ordering::Relaxed);
+                self.tun.send(&buf).await.ok().and(Some(()))
+            }
+            _ => None,
+        }
+    }
+
     /// Attempt to receive a datagram from the other end.
     ///
     /// This method takes `&self`, and it can be called safely by multiple threads
@@ -196,6 +211,19 @@ impl Socket {
                     if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
                         info!("Connection {} reset by peer", self);
                         return None;
+                    }
+
+                    let expected_ack = self.ack.load(Ordering::Relaxed);
+                    if is_keepalive_probe(&tcp_packet, expected_ack) {
+                        let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
+                        if let Err(e) = self.tun.try_send(&buf) {
+                            info!(
+                                "Connection {} unable to send keepalive ACK back: {}",
+                                self, e
+                            );
+                            return None;
+                        }
+                        return Some(0);
                     }
 
                     let payload = tcp_packet.payload();
@@ -317,6 +345,13 @@ impl Socket {
 
         None
     }
+}
+
+/// 判断收到的 TCP 报文是否为当前确认号对应的标准健康探测。
+fn is_keepalive_probe(packet: &tcp::TcpPacket<'_>, expected_ack: u32) -> bool {
+    packet.get_flags() == tcp::TcpFlags::ACK
+        && packet.payload().is_empty()
+        && packet.get_sequence() == expected_ack.wrapping_sub(1)
 }
 
 impl Drop for Socket {
@@ -556,5 +591,56 @@ impl Stack {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addresses() -> (SocketAddr, SocketAddr) {
+        (
+            "192.0.2.1:1234".parse().unwrap(),
+            "192.0.2.2:4567".parse().unwrap(),
+        )
+    }
+
+    #[test]
+    fn recognizes_keepalive_at_sequence_wrap() {
+        let (local, remote) = addresses();
+        let packet = build_tcp_keepalive_packet(local, remote, 0, 0);
+        let (_, tcp_packet) = parse_ip_packet(&packet).unwrap();
+        assert!(is_keepalive_probe(&tcp_packet, 0));
+    }
+
+    #[test]
+    fn ordinary_ack_is_not_a_probe() {
+        let (local, remote) = addresses();
+        let packet = build_tcp_packet(local, remote, 100, 100, tcp::TcpFlags::ACK, None);
+        let (_, tcp_packet) = parse_ip_packet(&packet).unwrap();
+        assert!(!is_keepalive_probe(&tcp_packet, 100));
+    }
+
+    #[test]
+    fn payload_packet_is_not_a_probe() {
+        let (local, remote) = addresses();
+        let packet = build_tcp_packet(local, remote, 100, 101, tcp::TcpFlags::ACK, Some(&[1u8]));
+        let (_, tcp_packet) = parse_ip_packet(&packet).unwrap();
+        assert!(!is_keepalive_probe(&tcp_packet, 101));
+    }
+
+    #[test]
+    fn rst_is_not_a_probe() {
+        let (local, remote) = addresses();
+        let packet = build_tcp_packet(
+            local,
+            remote,
+            100,
+            101,
+            tcp::TcpFlags::RST | tcp::TcpFlags::ACK,
+            None,
+        );
+        let (_, tcp_packet) = parse_ip_packet(&packet).unwrap();
+        assert!(!is_keepalive_probe(&tcp_packet, 101));
     }
 }

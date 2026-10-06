@@ -1,14 +1,15 @@
-use clap::{crate_version, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
+use phantun::keepalive::{KeepaliveConfig, monitor_keepalive};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, RwLock, watch};
 use tokio::time;
 use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
@@ -101,7 +102,43 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("keepalive_time")
+                .long("keepalive-time")
+                .value_name("SECONDS")
+                .default_value("60")
+                .value_parser(clap::value_parser!(u64).range(0..=86400))
+                .help("Seconds without remote input before keepalive probes; 0 disables the default-enabled monitor"),
+        )
+        .arg(
+            Arg::new("keepalive_interval")
+                .long("keepalive-interval")
+                .value_name("SECONDS")
+                .default_value("10")
+                .value_parser(clap::value_parser!(u64).range(1..=3600))
+                .help("Seconds between keepalive probes (default: 10)"),
+        )
+        .arg(
+            Arg::new("keepalive_retries")
+                .long("keepalive-retries")
+                .value_name("COUNT")
+                .default_value("3")
+                .value_parser(clap::value_parser!(u32).range(1..=20))
+                .help("Number of unanswered keepalive probes before closing (default: 3)"),
+        )
         .get_matches();
+
+    let keepalive_config = KeepaliveConfig {
+        time: time::Duration::from_secs(*matches.get_one::<u64>("keepalive_time").unwrap()),
+        interval: time::Duration::from_secs(*matches.get_one::<u64>("keepalive_interval").unwrap()),
+        retries: *matches.get_one::<u32>("keepalive_retries").unwrap(),
+    };
+    info!(
+        "Keepalive configured: time={}s interval={}s retries={}",
+        keepalive_config.time.as_secs(),
+        keepalive_config.interval.as_secs(),
+        keepalive_config.retries
+    );
 
     let local_addr: SocketAddr = matches
         .get_one::<String>("local")
@@ -175,7 +212,8 @@ async fn main() -> io::Result<()> {
         let mut buf_r = [0u8; MAX_PACKET_LEN];
 
         loop {
-            let (size, udp_remote_addr, udp_local_addr) = udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
+            let (size, udp_remote_addr, udp_local_addr) =
+                udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
             // seen UDP packet to listening socket, this means:
             // 1. It is a new UDP connection, or
             // 2. It is some extra packets not filtered by more specific
@@ -207,11 +245,13 @@ async fn main() -> io::Result<()> {
                 continue;
             }
 
-            assert!(connections
-                .write()
-                .await
-                .insert(udp_remote_addr, sock.clone())
-                .is_none());
+            assert!(
+                connections
+                    .write()
+                    .await
+                    .insert(udp_remote_addr, sock.clone())
+                    .is_none()
+            );
             debug!("inserted fake TCP socket into connection table");
 
             // spawn "fastpath" UDP socket and task, this will offload main task
@@ -219,11 +259,13 @@ async fn main() -> io::Result<()> {
 
             let packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
+            let (tcp_received_tx, tcp_received_rx) = watch::channel(time::Instant::now());
 
             for i in 0..num_cpus {
                 let sock = sock.clone();
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
+                let tcp_received_tx = tcp_received_tx.clone();
 
                 tokio::spawn(async move {
                     let mut buf_udp = [0u8; MAX_PACKET_LEN];
@@ -237,10 +279,7 @@ async fn main() -> io::Result<()> {
                     // connect to (<incoming packet src_ip>, <incoming packet src_port>).
                     let bind_addr = match (udp_remote_addr, udp_local_addr) {
                         (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
-                            SocketAddr::V4(SocketAddrV4::new(
-                                udp_local_ipv4,
-                                local_addr.port(),
-                            ))
+                            SocketAddr::V4(SocketAddrV4::new(udp_local_ipv4, local_addr.port()))
                         }
                         (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
                             SocketAddr::V6(SocketAddrV6::new(
@@ -251,7 +290,9 @@ async fn main() -> io::Result<()> {
                             ))
                         }
                         (_, _) => {
-                            panic!("unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}");
+                            panic!(
+                                "unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}"
+                            );
                         }
                     };
                     let udp_sock = new_udp_reuseport(bind_addr);
@@ -271,12 +312,16 @@ async fn main() -> io::Result<()> {
                             res = sock.recv(&mut buf_tcp) => {
                                 match res {
                                     Some(size) => {
+                                        tcp_received_tx.send_modify(|last| *last = time::Instant::now());
                                         if size > 0
                                             && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
                                                 error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
                                                 quit.cancel();
                                                 return;
                                             }
+                                        if size > 0 {
+                                            packet_received.notify_one();
+                                        }
                                     },
                                     None => {
                                         debug!("removed fake TCP socket from connections table");
@@ -284,8 +329,6 @@ async fn main() -> io::Result<()> {
                                         return;
                                     },
                                 }
-
-                                packet_received.notify_one();
                             },
                             _ = quit.cancelled() => {
                                 debug!("worker {} terminated", i);
@@ -297,7 +340,13 @@ async fn main() -> io::Result<()> {
             }
 
             let connections = connections.clone();
+            let monitor_sock = sock.clone();
+            let monitor = monitor_keepalive(keepalive_config, tcp_received_rx, move || {
+                let monitor_sock = monitor_sock.clone();
+                async move { monitor_sock.send_keepalive().await }
+            });
             tokio::spawn(async move {
+                tokio::pin!(monitor);
                 loop {
                     let read_timeout = time::sleep(UDP_TTL);
                     let packet_received_fut = packet_received.notified();
@@ -317,6 +366,16 @@ async fn main() -> io::Result<()> {
                             return;
                         },
                         _ = packet_received_fut => {},
+                        reason = &mut monitor => {
+                            warn!(
+                                "Keepalive failed for UDP peer {} remote {}: {:?}",
+                                udp_remote_addr, remote_addr, reason
+                            );
+                            connections.write().await.remove(&udp_remote_addr);
+                            debug!("removed fake TCP socket from connections table");
+                            quit.cancel();
+                            return;
+                        },
                     }
                 }
             });

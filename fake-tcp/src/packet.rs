@@ -127,6 +127,23 @@ pub fn build_tcp_packet(
     ip_buf.freeze()
 }
 
+/// 构造不携带业务数据、仅用于确认连接仍可达的标准 ACK 探测报文。
+pub fn build_tcp_keepalive_packet(
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    next_seq: u32,
+    ack: u32,
+) -> Bytes {
+    build_tcp_packet(
+        local_addr,
+        remote_addr,
+        next_seq.wrapping_sub(1),
+        ack,
+        tcp::TcpFlags::ACK,
+        None,
+    )
+}
+
 pub fn parse_ip_packet(buf: &Bytes) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)> {
     if buf[0] >> 4 == 4 {
         let v4 = ipv4::Ipv4Packet::new(buf).unwrap();
@@ -149,11 +166,57 @@ pub fn parse_ip_packet(buf: &Bytes) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keepalive_ipv4_has_no_payload() {
+        let local = "192.0.2.1:1234".parse().unwrap();
+        let remote = "192.0.2.2:4567".parse().unwrap();
+        let packet = build_tcp_keepalive_packet(local, remote, 8, 21);
+        let (ip, tcp) = parse_ip_packet(&packet).unwrap();
+        assert_eq!(ip.get_source(), local.ip());
+        assert_eq!(ip.get_destination(), remote.ip());
+        assert_eq!(tcp.get_source(), local.port());
+        assert_eq!(tcp.get_destination(), remote.port());
+        assert_eq!(tcp.get_flags(), tcp::TcpFlags::ACK);
+        assert_eq!(tcp.get_sequence(), 7);
+        assert_eq!(tcp.get_acknowledgement(), 21);
+        assert_eq!(tcp.payload(), &[]);
+    }
+
+    #[test]
+    fn keepalive_ipv6_has_no_payload() {
+        let local = "[2001:db8::1]:1234".parse().unwrap();
+        let remote = "[2001:db8::2]:4567".parse().unwrap();
+        let packet = build_tcp_keepalive_packet(local, remote, 8, 21);
+        let (ip, tcp) = parse_ip_packet(&packet).unwrap();
+        assert_eq!(ip.get_source(), local.ip());
+        assert_eq!(ip.get_destination(), remote.ip());
+        assert_eq!(tcp.get_source(), local.port());
+        assert_eq!(tcp.get_destination(), remote.port());
+        assert_eq!(tcp.get_flags(), tcp::TcpFlags::ACK);
+        assert_eq!(tcp.get_sequence(), 7);
+        assert_eq!(tcp.get_acknowledgement(), 21);
+        assert_eq!(tcp.payload(), &[]);
+    }
+
+    #[test]
+    fn keepalive_sequence_wraps() {
+        let local = "192.0.2.1:1234".parse().unwrap();
+        let remote = "192.0.2.2:4567".parse().unwrap();
+        let packet = build_tcp_keepalive_packet(local, remote, 0, 21);
+        let (_, tcp) = parse_ip_packet(&packet).unwrap();
+        assert_eq!(tcp.get_sequence(), u32::MAX);
+    }
+}
+
 #[cfg(all(test, feature = "benchmark"))]
 mod benchmarks {
     extern crate test;
     use super::*;
-    use test::{black_box, Bencher};
+    use test::{Bencher, black_box};
 
     #[bench]
     fn bench_build_tcp_packet_1460(b: &mut Bencher) {

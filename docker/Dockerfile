@@ -28,6 +28,7 @@ COPY docker/phantun.sh /usr/local/bin/
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         iproute2 iptables procps && \
+    chmod +x /usr/local/bin/phantun.sh && \
     rm -rf /var/lib/apt/lists/*
 
 ENV USE_IPTABLES_NFT_BACKEND=0

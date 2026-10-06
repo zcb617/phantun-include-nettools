@@ -1,6 +1,6 @@
 [package]
 name = "phantun"
-version = "0.8.1"
+version = "0.8.1-reconnect.1"
 edition = "2024"
 authors = ["Datong Sun <dndx@idndx.com>"]
 license = "MIT OR Apache-2.0"
@@ -22,3 +22,6 @@ neli = "0"
 nix = { version = "0", features = ["net", "uio", "socket"] }
 tokio = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

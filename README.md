@@ -100,6 +100,21 @@ and change the destination IP address to where the server is listening for incom
 In those cases, the machine/iptables running Phantun acts as the "router" that allows Phantun
 to communicate with outside using it's private IP addresses.
 
+## Connection recovery keepalive
+
+The client starts a keepalive probe after 60 seconds without remote input. It sends one probe every
+10 seconds and closes the stale connection after 3 unanswered probes; subsequent UDP traffic then
+creates a new connection. Configure these values with `--keepalive-time`, `--keepalive-interval`,
+and `--keepalive-retries`. Set `--keepalive-time 0` to disable keepalive monitoring. UDP idle
+expiration at 180 seconds remains independent of keepalive monitoring.
+
+The updated server understands the keepalive response, so update both ends together. Complete idle
+probe compatibility with an older server is not guaranteed. To run the isolated recovery check:
+
+```bash
+sudo python3 tests/recovery_netns.py --client target/debug/client --server target/debug/server
+```
+
 As of Phantun v0.4.1, IPv6 is fully supported for both TCP and UDP sides.
 To specify an IPv6 address, use the following format: `[::1]:1234` with
 the command line options. Resolving AAAA record is also supported. Please run the program
