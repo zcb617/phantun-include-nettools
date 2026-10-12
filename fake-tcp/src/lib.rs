@@ -361,7 +361,7 @@ impl Drop for Socket {
         // dissociates ourself from the dispatch map
         assert!(self.shared.tuples.write().unwrap().remove(&tuple).is_some());
         // purge cache
-        self.shared.tuples_purge.send(tuple).unwrap();
+        notify_tuple_purge(&self.shared.tuples_purge, tuple);
 
         let buf = build_tcp_packet(
             self.local_addr,
@@ -379,6 +379,16 @@ impl Drop for Socket {
     }
 }
 
+/// 通知所有 reader 清理指定连接的本地缓存，避免无订阅者时清理连接触发 panic。
+fn notify_tuple_purge(sender: &broadcast::Sender<AddrTuple>, tuple: AddrTuple) {
+    if let Err(error) = sender.send(tuple) {
+        warn!(
+            "No active reader subscribed to tuple purge notification: {:?}",
+            error
+        );
+    }
+}
+
 impl fmt::Display for Socket {
     /// User-friendly string representation of the socket
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -387,6 +397,32 @@ impl fmt::Display for Socket {
             "(Fake TCP connection from {} to {})",
             self.local_addr, self.remote_addr
         )
+    }
+}
+
+/// 根据连接清理广播事件更新 reader 的本地连接缓存，并在广播滞后时恢复缓存一致性。
+fn apply_tuple_purge(
+    tuples: &mut HashMap<AddrTuple, flume::Sender<Bytes>>,
+    event: Result<AddrTuple, broadcast::error::RecvError>,
+) -> bool {
+    match event {
+        Ok(tuple) => {
+            tuples.remove(&tuple);
+            trace!("Removed cached tuple: {:?}", tuple);
+            true
+        }
+        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            tuples.clear();
+            warn!(
+                "Tuple purge broadcast lagged by {}, cleared local tuple cache",
+                skipped
+            );
+            true
+        }
+        Err(broadcast::error::RecvError::Closed) => {
+            error!("Tuple purge broadcast channel closed, stopping reader");
+            false
+        }
     }
 }
 
@@ -506,15 +542,16 @@ impl Stack {
                             let remote_addr = SocketAddr::new(ip_packet.get_source(), tcp_packet.get_source());
 
                             let tuple = AddrTuple::new(local_addr, remote_addr);
-                            if let Some(c) = tuples.get(&tuple) {
+                            if let Some(c) = tuples.get(&tuple).cloned() {
                                 if c.send_async(buf).await.is_err() {
-                                    trace!("Cache hit, but receiver already closed, dropping packet");
+                                    tuples.remove(&tuple);
+                                    trace!(
+                                        "Cache hit, but receiver already closed, removing cached tuple: {:?}",
+                                        tuple
+                                    );
                                 }
 
                                 continue;
-
-                                // If not Ok, receiver has been closed and just fall through to the slow
-                                // path below
                             } else {
                                 trace!("Cache miss, checking the shared tuples table for connection");
                                 let sender = {
@@ -524,8 +561,14 @@ impl Stack {
 
                                 if let Some(c) = sender {
                                     trace!("Storing connection information into local tuples");
-                                    tuples.insert(tuple, c.clone());
-                                    c.send_async(buf).await.unwrap();
+                                    tuples.insert(tuple.clone(), c.clone());
+                                    if c.send_async(buf).await.is_err() {
+                                        tuples.remove(&tuple);
+                                        trace!(
+                                            "Shared tuple receiver already closed, removing cached tuple: {:?}",
+                                            tuple
+                                        );
+                                    }
                                     continue;
                                 }
                             }
@@ -564,7 +607,12 @@ impl Stack {
                                         tcp::TcpFlags::RST | tcp::TcpFlags::ACK,
                                         None,
                                     );
-                                    shared.tun[0].try_send(&buf).unwrap();
+                                    if let Err(error) = shared.tun[0].try_send(&buf) {
+                                        warn!(
+                                            "Unable to send RST to {}: {}",
+                                            remote_addr, error
+                                        );
+                                    }
                                 }
                             } else if (tcp_packet.get_flags() & tcp::TcpFlags::RST) == 0 {
                                 info!("Unknown TCP packet from {}, sending RST", remote_addr);
@@ -576,7 +624,12 @@ impl Stack {
                                     tcp::TcpFlags::RST | tcp::TcpFlags::ACK,
                                     None,
                                 );
-                                shared.tun[0].try_send(&buf).unwrap();
+                                if let Err(error) = shared.tun[0].try_send(&buf) {
+                                    warn!(
+                                        "Unable to send RST to {}: {}",
+                                        remote_addr, error
+                                    );
+                                }
                             }
                         }
                         None => {
@@ -585,9 +638,9 @@ impl Stack {
                     }
                 },
                 tuple = tuples_purge.recv() => {
-                    let tuple = tuple.unwrap();
-                    tuples.remove(&tuple);
-                    trace!("Removed cached tuple: {:?}", tuple);
+                    if !apply_tuple_purge(&mut tuples, tuple) {
+                        return;
+                    }
                 }
             }
         }
@@ -642,5 +695,94 @@ mod tests {
         );
         let (_, tcp_packet) = parse_ip_packet(&packet).unwrap();
         assert!(!is_keepalive_probe(&tcp_packet, 101));
+    }
+
+    /// 验证广播滞后时清空本地缓存，并继续处理滞后后的清理通知。
+    #[tokio::test]
+    async fn purge_lag_clears_stale_cache_and_receives_next_event() {
+        let (sender, mut receiver) = broadcast::channel(16);
+        let mut tuples = HashMap::new();
+        let (stale_sender, stale_receiver) = flume::bounded(1);
+        drop(stale_receiver);
+        let stale_tuple = AddrTuple::new(
+            "192.0.2.1:1234".parse().unwrap(),
+            "192.0.2.2:4567".parse().unwrap(),
+        );
+        tuples.insert(stale_tuple, stale_sender);
+
+        for port in 0..19 {
+            let tuple = AddrTuple::new(
+                "192.0.2.1:1234".parse().unwrap(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 5000 + port),
+            );
+            sender.send(tuple).unwrap();
+        }
+
+        let event = receiver.recv().await;
+        assert!(matches!(
+            &event,
+            Err(broadcast::error::RecvError::Lagged(3))
+        ));
+        assert!(apply_tuple_purge(&mut tuples, event));
+        assert!(tuples.is_empty());
+
+        for _ in 0..16 {
+            assert!(apply_tuple_purge(&mut tuples, receiver.recv().await));
+        }
+
+        let next_tuple = AddrTuple::new(
+            "192.0.2.1:1234".parse().unwrap(),
+            "192.0.2.2:6000".parse().unwrap(),
+        );
+        let (next_sender, _next_receiver) = flume::bounded(1);
+        tuples.insert(next_tuple.clone(), next_sender);
+        sender.send(next_tuple.clone()).unwrap();
+        assert!(apply_tuple_purge(&mut tuples, receiver.recv().await));
+        assert!(!tuples.contains_key(&next_tuple));
+    }
+
+    /// 验证正常清理通知只删除目标连接的本地缓存。
+    #[test]
+    fn purge_removes_only_target_tuple() {
+        let (local, remote) = addresses();
+        let first_tuple = AddrTuple::new(local, remote);
+        let second_tuple = AddrTuple::new(local, "192.0.2.3:4567".parse().unwrap());
+        let (first_sender, _first_receiver) = flume::bounded(1);
+        let (second_sender, _second_receiver) = flume::bounded(1);
+        let mut tuples = HashMap::new();
+        tuples.insert(first_tuple.clone(), first_sender);
+        tuples.insert(second_tuple.clone(), second_sender);
+
+        assert!(apply_tuple_purge(&mut tuples, Ok(first_tuple.clone())));
+        assert!(!tuples.contains_key(&first_tuple));
+        assert!(tuples.contains_key(&second_tuple));
+    }
+
+    /// 验证清理广播关闭后 reader 停止继续处理清理事件。
+    #[tokio::test]
+    async fn closed_purge_channel_stops_reader() {
+        let (sender, mut receiver) = broadcast::channel(16);
+        drop(sender);
+        let mut tuples = HashMap::new();
+
+        let event = receiver.recv().await;
+        assert!(matches!(&event, Err(broadcast::error::RecvError::Closed)));
+        assert!(!apply_tuple_purge(&mut tuples, event));
+    }
+
+    /// 验证没有 reader 订阅者时通知不会 panic，并在新订阅者存在时正常送达。
+    #[tokio::test]
+    async fn purge_notification_without_receivers_does_not_panic() {
+        let (sender, receiver) = broadcast::channel(16);
+        drop(receiver);
+        let tuple = AddrTuple::new(
+            "192.0.2.1:1234".parse().unwrap(),
+            "192.0.2.2:4567".parse().unwrap(),
+        );
+        notify_tuple_purge(&sender, tuple.clone());
+
+        let mut receiver = sender.subscribe();
+        notify_tuple_purge(&sender, tuple.clone());
+        assert_eq!(receiver.recv().await.unwrap(), tuple);
     }
 }
