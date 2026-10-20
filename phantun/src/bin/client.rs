@@ -3,7 +3,9 @@ use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info, warn};
 use phantun::keepalive::{KeepaliveConfig, monitor_keepalive};
-use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
+use phantun::utils::{
+    assign_ipv6_address, ensure_tun_tx_queue_len, new_udp_reuseport, udp_recv_pktinfo,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -17,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use phantun::UDP_TTL;
 
 #[tokio::main]
+/// Runs the client that converts incoming UDP datagrams into fake TCP traffic.
 async fn main() -> io::Result<()> {
     pretty_env_logger::init();
 
@@ -197,6 +200,13 @@ async fn main() -> io::Result<()> {
         .build()
         .unwrap();
 
+    let tx_queue_len = ensure_tun_tx_queue_len(tun[0].name(), 4096)?;
+    info!(
+        "TUN device {} transmit queue length is {}",
+        tun[0].name(),
+        tx_queue_len
+    );
+
     if remote_addr.is_ipv6() {
         assign_ipv6_address(tun[0].name(), tun_local6.unwrap(), tun_peer6.unwrap());
     }
@@ -261,7 +271,9 @@ async fn main() -> io::Result<()> {
             let quit = CancellationToken::new();
             let (tcp_received_tx, tcp_received_rx) = watch::channel(time::Instant::now());
 
-            for i in 0..num_cpus {
+            // One connection worker keeps dequeue and UDP sends in order for this fake TCP
+            // connection; separate connections still run concurrently on Tokio's worker threads.
+            {
                 let sock = sock.clone();
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
@@ -331,7 +343,7 @@ async fn main() -> io::Result<()> {
                                 }
                             },
                             _ = quit.cancelled() => {
-                                debug!("worker {} terminated", i);
+                                debug!("connection worker terminated");
                                 return;
                             },
                         };

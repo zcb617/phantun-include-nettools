@@ -18,6 +18,96 @@ use std::os::unix::io::AsRawFd;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
+/// Ensures the TUN transmit queue can absorb packet bursts without reducing a larger queue.
+///
+/// Increasing the queue minimum helps prevent TUN transmit drops during bursts; the caller
+/// receives the effective kernel queue length so it can report the configured capacity.
+pub fn ensure_tun_tx_queue_len(device_name: &str, minimum: i32) -> std::io::Result<i32> {
+    if minimum <= 0
+        || device_name.is_empty()
+        || device_name.len() >= nix::libc::IFNAMSIZ
+        || device_name.as_bytes().contains(&0)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid TUN device name or transmit queue minimum",
+        ));
+    }
+
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+    let mut request = unsafe {
+        // SAFETY: `ifreq` is a C-compatible structure whose fields can be initialized to zero;
+        // the zeroed name and integer union member are valid before the ioctl fills them.
+        std::mem::zeroed::<nix::libc::ifreq>()
+    };
+    for (index, byte) in device_name.as_bytes().iter().enumerate() {
+        request.ifr_name[index] = *byte as nix::libc::c_char;
+    }
+
+    let descriptor = socket.as_raw_fd();
+    let get_result = unsafe {
+        // SAFETY: `descriptor` is an open IPv4 datagram socket and `request` is an initialized
+        // `ifreq` with a NUL-terminated interface name and the correct C structure size.
+        nix::libc::ioctl(
+            descriptor,
+            nix::libc::SIOCGIFTXQLEN as _,
+            &mut request as *mut nix::libc::ifreq,
+        )
+    };
+    if get_result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let current = unsafe {
+        // SAFETY: libc 0.2.175 does not expose `ifru_ivalue`; `ifru_metric` is its `c_int`
+        // layout alias at offset zero in the same union. SIOC*IFTXQLEN defines this integer as
+        // the transmit queue length, so this does not read or write the interface metric.
+        // Successful SIOCGIFTXQLEN initialized the ifreq integer union member.
+        request.ifr_ifru.ifru_metric
+    };
+    if current >= minimum {
+        return Ok(current);
+    }
+
+    request.ifr_ifru.ifru_metric = minimum;
+    let set_result = unsafe {
+        // SAFETY: `descriptor` is the same open datagram socket and `request` is a valid ifreq
+        // containing the interface name and requested transmit queue length.
+        nix::libc::ioctl(
+            descriptor,
+            nix::libc::SIOCSIFTXQLEN as _,
+            &mut request as *mut nix::libc::ifreq,
+        )
+    };
+    if set_result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let verify_result = unsafe {
+        // SAFETY: `descriptor` is still open and `request` remains a valid, initialized ifreq.
+        nix::libc::ioctl(
+            descriptor,
+            nix::libc::SIOCGIFTXQLEN as _,
+            &mut request as *mut nix::libc::ifreq,
+        )
+    };
+    if verify_result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let actual = unsafe {
+        // SAFETY: successful SIOCGIFTXQLEN initialized the ifreq integer union member.
+        request.ifr_ifru.ifru_metric
+    };
+    if actual < minimum {
+        return Err(std::io::Error::other(format!(
+            "TUN device {device_name} transmit queue length is {actual}, below requested minimum {minimum}"
+        )));
+    }
+
+    Ok(actual)
+}
+
 pub fn new_udp_reuseport(local_addr: SocketAddr) -> UdpSocket {
     let udp_sock = socket2::Socket::new(
         if local_addr.is_ipv4() {

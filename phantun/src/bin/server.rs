@@ -1,8 +1,8 @@
-use clap::{crate_version, Arg, ArgAction, Command};
-use fake_tcp::packet::MAX_PACKET_LEN;
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::Stack;
+use fake_tcp::packet::MAX_PACKET_LEN;
 use log::{debug, error, info};
-use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
+use phantun::utils::{assign_ipv6_address, ensure_tun_tx_queue_len, new_udp_reuseport};
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use phantun::UDP_TTL;
 
 #[tokio::main]
+/// Runs the server that converts fake TCP connections back into UDP datagrams.
 async fn main() -> io::Result<()> {
     pretty_env_logger::init();
 
@@ -159,6 +160,13 @@ async fn main() -> io::Result<()> {
         .build()
         .unwrap();
 
+    let tx_queue_len = ensure_tun_tx_queue_len(tun[0].name(), 4096)?;
+    info!(
+        "TUN device {} transmit queue length is {}",
+        tun[0].name(),
+        tx_queue_len
+    );
+
     if let (Some(tun_local6), Some(tun_peer6)) = (tun_local6, tun_peer6) {
         assign_ipv6_address(tun[0].name(), tun_local6, tun_peer6);
     }
@@ -197,7 +205,9 @@ async fn main() -> io::Result<()> {
             let local_addr = udp_sock.local_addr()?;
             drop(udp_sock);
 
-            for i in 0..num_cpus {
+            // Each connection has one worker so reads and UDP sends preserve that connection's
+            // processing order; independent connections remain concurrent.
+            {
                 let sock = sock.clone();
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
@@ -235,7 +245,7 @@ async fn main() -> io::Result<()> {
                                 packet_received.notify_one();
                             },
                             _ = quit.cancelled() => {
-                                debug!("worker {} terminated", i);
+                                debug!("connection worker terminated");
                                 return;
                             },
                         };
