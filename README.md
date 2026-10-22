@@ -1,6 +1,6 @@
 # Phantun：与上游原版的区别
 
-本项目基于 [dndx/phantun](https://github.com/dndx/phantun)，当前自定义版本为 `0.8.1-reconnect.1`。上游的项目介绍和通用用法请查看原仓库。
+本项目基于 [dndx/phantun](https://github.com/dndx/phantun)，当前自定义版本为 `0.8.1-reconnect.3`。上游的项目介绍和通用用法请查看原仓库。
 
 ## 连接自动恢复
 
@@ -28,7 +28,7 @@
 | ARMv7 | `armv7-unknown-linux-musleabihf` |
 | ARM64 | `aarch64-unknown-linux-musl` |
 
-- Tag 匹配 `v*.*.*`，例如 `v0.8.1-reconnect.1`。
+- Tag 匹配 `v*.*.*`，例如 `v0.8.1-reconnect.3`。
 - 每个平台生成一个 `.tar.gz` 原生包，包含 `phantun_client`、`phantun_server` 和 `VERSION`；Release 同时提供总 `SHA256SUMS`。
 - 固定 Rust `1.90.0` 并使用锁定依赖，构建静态 musl ELF，不依赖目标系统的 glibc；发布流程不生成 Docker TAR。
 - 保留 Actions artifacts（14 天）及手动编译入口；普通分支手动运行只生成 artifacts。
