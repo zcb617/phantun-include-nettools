@@ -40,6 +40,7 @@ for line in sys.stdin:
         end = time.monotonic() + command["duration"]
         sent = 0
         matched = 0
+        unsolicited = 0
         expected = {}
         while time.monotonic() < end:
             payload = json.dumps({"phase": phase, "count": sent}, separators=(",", ":")).encode()
@@ -55,8 +56,10 @@ for line in sys.stdin:
                 if data in expected:
                     matched += 1
                     del expected[data]
+                elif data == b"unsolicited-downlink":
+                    unsolicited += 1
             time.sleep(max(0, min(0.1, end - time.monotonic())))
-        print(json.dumps({"op": "roundtrip", "phase": phase, "matched": matched, "sent": sent}), flush=True)
+        print(json.dumps({"op": "roundtrip", "phase": phase, "matched": matched, "unsolicited": unsolicited, "sent": sent}), flush=True)
     elif command["op"] == "idle":
         end = time.monotonic() + command["duration"]
         unexpected = 0
@@ -72,13 +75,29 @@ for line in sys.stdin:
 
 
 ECHO_CODE = r'''
+import select
 import socket
+import sys
+import time
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("127.0.0.1", 1234))
+address = None
+pushing = False
+next_push = 0
 while True:
-    data, address = sock.recvfrom(65535)
-    sock.sendto(data, address)
+    timeout = max(0, next_push - time.monotonic()) if pushing else None
+    ready, _, _ = select.select([sock, sys.stdin], [], [], timeout)
+    if sock in ready:
+        data, address = sock.recvfrom(65535)
+        sock.sendto(data, address)
+    if sys.stdin in ready and sys.stdin.readline().strip() == "push":
+        pushing = True
+        next_push = time.monotonic()
+    if pushing and time.monotonic() >= next_push:
+        if address is not None:
+            sock.sendto(b"unsolicited-downlink", address)
+        next_push = time.monotonic() + 0.2
 '''
 
 
@@ -265,15 +284,19 @@ def main():
             print(json.dumps({"stage": "pre-fault", **recovered}))
             if recovered["matched"] < 5:
                 raise RuntimeError("pre-fault roundtrip failed")
+            if count_connections(server_log) != 1:
+                raise RuntimeError("healthy idle unexpected reconnect")
 
             old_port = source_port(server_log)
             old_drop = ["iptables", "-I", "FORWARD", "1", "-p", "tcp", "--sport", str(old_port), "--dport", "4567", "-j", "DROP"]
             all_drop = ["iptables", "-I", "FORWARD", "1", "-p", "tcp", "--dport", "4567", "-j", "DROP"]
             run_command(namespace_command(client_namespace, old_drop))
             run_command(namespace_command(client_namespace, all_drop))
+            echo.stdin.write("push\n")
+            echo.stdin.flush()
             fault = send_driver(driver, {"op": "roundtrip", "phase": "fault", "duration": 7})
             print(json.dumps({"stage": "fault", **fault}))
-            if fault["matched"] != 0 or client.poll() is not None:
+            if fault["matched"] != 0 or fault["unsolicited"] < 3 or client.poll() is not None or client.pid != original_pid:
                 raise RuntimeError("fault phase unexpectedly returned traffic or stopped client")
             client_log_text = client_log.read_text(encoding="utf-8", errors="replace")
             if args.baseline_client:
@@ -289,8 +312,8 @@ def main():
             if args.baseline_client:
                 if post_fault["matched"] != 0 or connection_count != 1 or client.poll() is not None:
                     raise RuntimeError("baseline client did not reproduce the stale connection")
-            elif post_fault["matched"] < 5 or connection_count < 2 or client.poll() is not None:
-                raise RuntimeError("fixed client did not establish a replacement connection")
+            elif post_fault["matched"] < 5 or connection_count != 2 or client.poll() is not None:
+                raise RuntimeError("fixed client did not maintain exactly one replacement connection")
             if client.pid != original_pid:
                 raise RuntimeError("client process changed during recovery")
             print(json.dumps({"stage": "complete", "connections": connection_count, "client_pid": client.pid}))

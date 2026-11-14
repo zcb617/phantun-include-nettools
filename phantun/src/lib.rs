@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+pub mod heartbeat;
 pub mod keepalive;
 pub mod utils;
 

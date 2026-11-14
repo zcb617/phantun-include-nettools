@@ -40,6 +40,7 @@
 
 #![cfg_attr(feature = "benchmark", feature(test))]
 
+mod heartbeat;
 pub mod packet;
 
 use bytes::{Bytes, BytesMut};
@@ -102,6 +103,12 @@ pub enum State {
     Established,
 }
 
+/// 标识心跳报文的收发角色。
+enum SocketRole {
+    Client,
+    Server,
+}
+
 pub struct Socket {
     shared: Arc<Shared>,
     tun: Arc<Tun>,
@@ -112,6 +119,10 @@ pub struct Socket {
     ack: AtomicU32,
     last_ack: AtomicU32,
     state: State,
+    /// 当前连接的心跳角色。
+    role: SocketRole,
+    /// 接收心跳应答的通知通道。
+    heartbeat_tx: broadcast::Sender<u16>,
 }
 
 /// A socket that represents a unique TCP connection between a server and client.
@@ -129,8 +140,10 @@ impl Socket {
         remote_addr: SocketAddr,
         ack: Option<u32>,
         state: State,
+        role: SocketRole,
     ) -> (Socket, flume::Sender<Bytes>) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
+        let (heartbeat_tx, _) = broadcast::channel(32);
 
         (
             Socket {
@@ -143,6 +156,8 @@ impl Socket {
                 ack: AtomicU32::new(ack.unwrap_or(0)),
                 last_ack: AtomicU32::new(ack.unwrap_or(0)),
                 state,
+                role,
+                heartbeat_tx,
             },
             incoming_tx,
         )
@@ -180,6 +195,27 @@ impl Socket {
         }
     }
 
+    /// 订阅当前连接的心跳应答。
+    pub fn subscribe_heartbeat(&self) -> broadcast::Receiver<u16> {
+        self.heartbeat_tx.subscribe()
+    }
+
+    /// 在当前连接上发送不推进序号的心跳探测。
+    pub async fn send_heartbeat(&self, ticket: u16) -> Option<()> {
+        // 检查编号并用当前连接序号构造探测。
+        if ticket < heartbeat::MIN_TICKET || !matches!(self.state, State::Established) {
+            return None;
+        }
+        let buf = heartbeat::build(
+            self.local_addr,
+            self.remote_addr,
+            self.seq.load(Ordering::Relaxed),
+            self.ack.load(Ordering::Relaxed),
+            ticket,
+        );
+        self.tun.send(&buf).await.ok().and(Some(()))
+    }
+
     /// 发送不推进本地序号的 ACK 型健康探测，确认本地 Tun 仍可写入。
     pub async fn send_keepalive(&self) -> Option<()> {
         match self.state {
@@ -213,6 +249,27 @@ impl Socket {
                         return None;
                     }
 
+                    // 心跳只进行应答或通知，不转发为 UDP 数据。
+                    if let Some(ticket) = heartbeat::decode(&tcp_packet) {
+                        match self.role {
+                            SocketRole::Server => {
+                                let reply = heartbeat::build(
+                                    self.local_addr,
+                                    self.remote_addr,
+                                    self.seq.load(Ordering::Relaxed),
+                                    self.ack.load(Ordering::Relaxed),
+                                    ticket,
+                                );
+                                if self.tun.try_send(&reply).is_err() {
+                                    return None;
+                                }
+                            }
+                            SocketRole::Client => {
+                                let _ = self.heartbeat_tx.send(ticket);
+                            }
+                        }
+                        return Some(0);
+                    }
                     let expected_ack = self.ack.load(Ordering::Relaxed);
                     if is_keepalive_probe(&tcp_packet, expected_ack) {
                         let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
@@ -504,6 +561,7 @@ impl Stack {
                     addr,
                     None,
                     State::Idle,
+                    SocketRole::Client,
                 );
 
                 assert!(tuples.insert(tuple, incoming).is_none());
@@ -589,6 +647,7 @@ impl Stack {
                                         remote_addr,
                                         Some(tcp_packet.get_sequence() + 1),
                                         State::Idle,
+                                        SocketRole::Server,
                                     );
                                     assert!(shared
                                         .tuples

@@ -39,6 +39,19 @@ pub fn build_tcp_packet(
     flags: u8,
     payload: Option<&[u8]>,
 ) -> Bytes {
+    build_tcp_packet_with_window(local_addr, remote_addr, seq, ack, flags, payload, 0xffff)
+}
+
+/// 构造指定窗口的 TCP 报文，用于承载心跳编号。
+pub(crate) fn build_tcp_packet_with_window(
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: Option<&[u8]>,
+    window: u16,
+) -> Bytes {
     let ip_header_len = match local_addr {
         SocketAddr::V4(_) => IPV4_HEADER_LEN,
         SocketAddr::V6(_) => IPV6_HEADER_LEN,
@@ -81,7 +94,7 @@ pub fn build_tcp_packet(
     };
 
     let mut tcp = tcp::MutableTcpPacket::new(&mut tcp_buf).unwrap();
-    tcp.set_window(0xffff);
+    tcp.set_window(window);
     tcp.set_source(local_addr.port());
     tcp.set_destination(remote_addr.port());
     tcp.set_sequence(seq);

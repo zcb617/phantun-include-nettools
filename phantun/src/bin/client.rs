@@ -2,6 +2,7 @@ use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info, warn};
+use phantun::heartbeat::monitor_heartbeat;
 use phantun::keepalive::{KeepaliveConfig, monitor_keepalive};
 use phantun::utils::{
     assign_ipv6_address, ensure_tun_tx_queue_len, new_udp_reuseport, udp_recv_pktinfo,
@@ -111,7 +112,7 @@ async fn main() -> io::Result<()> {
                 .value_name("SECONDS")
                 .default_value("60")
                 .value_parser(clap::value_parser!(u64).range(0..=86400))
-                .help("Seconds without remote input before keepalive probes; 0 disables the default-enabled monitor"),
+                .help("Seconds between successful heartbeat cycles; 0 disables keepalive"),
         )
         .arg(
             Arg::new("keepalive_interval")
@@ -129,8 +130,10 @@ async fn main() -> io::Result<()> {
                 .value_parser(clap::value_parser!(u32).range(1..=20))
                 .help("Number of unanswered keepalive probes before closing (default: 3)"),
         )
+        .arg(Arg::new("legacy_keepalive").long("legacy-keepalive").action(ArgAction::SetTrue).help("Use legacy keepalive when connecting to an older server"))
         .get_matches();
 
+    let legacy_keepalive = matches.get_flag("legacy_keepalive");
     let keepalive_config = KeepaliveConfig {
         time: time::Duration::from_secs(*matches.get_one::<u64>("keepalive_time").unwrap()),
         interval: time::Duration::from_secs(*matches.get_one::<u64>("keepalive_interval").unwrap()),
@@ -353,10 +356,23 @@ async fn main() -> io::Result<()> {
 
             let connections = connections.clone();
             let monitor_sock = sock.clone();
-            let monitor = monitor_keepalive(keepalive_config, tcp_received_rx, move || {
-                let monitor_sock = monitor_sock.clone();
-                async move { monitor_sock.send_keepalive().await }
-            });
+            let heartbeat_rx = monitor_sock.subscribe_heartbeat();
+            // 根据兼容模式选择旧探测或带编号的周期心跳。
+            let monitor = async move {
+                if legacy_keepalive {
+                    monitor_keepalive(keepalive_config, tcp_received_rx, move || {
+                        let monitor_sock = monitor_sock.clone();
+                        async move { monitor_sock.send_keepalive().await }
+                    })
+                    .await
+                } else {
+                    monitor_heartbeat(keepalive_config, heartbeat_rx, move |ticket| {
+                        let monitor_sock = monitor_sock.clone();
+                        async move { monitor_sock.send_heartbeat(ticket).await }
+                    })
+                    .await
+                }
+            };
             tokio::spawn(async move {
                 tokio::pin!(monitor);
                 loop {
